@@ -3,7 +3,6 @@ name: Build Wisp APK
 on:
   push:
     branches: [main, master]
-    paths: ['app/hosts.txt', 'base/**', 'scripts/**', '.github/workflows/main.yml']
   workflow_dispatch:
 
 jobs:
@@ -19,8 +18,38 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Diagnostic - fichiers du dépôt
+        run: |
+          pwd
+          find . -path ./.git -prune -o -type f -print | head -50
+
       - name: Patch hosts.txt dans l'APK
-        run: python3 scripts/patch_apk.py base/Wisp-base.apk app/hosts.txt unsigned.apk
+        run: |
+          BASE=$(find . -path ./.git -prune -o -iname '*.apk' -print | grep -v unsigned | head -1)
+          HOSTS=$(find . -path ./.git -prune -o -name 'hosts.txt' -print | head -1)
+          echo "APK de base : $BASE"
+          echo "hosts.txt   : $HOSTS"
+          [ -n "$BASE" ] || { echo "::error::Aucun APK de base trouvé (base/Wisp-base.apk manquant ?)"; exit 1; }
+          [ -n "$HOSTS" ] || { echo "::error::hosts.txt introuvable (app/hosts.txt manquant ?)"; exit 1; }
+          python3 - "$BASE" "$HOSTS" unsigned.apk <<'PY'
+          import sys, zipfile
+          base, hosts, out = sys.argv[1:4]
+          new = open(hosts, 'rb').read()
+          found = False
+          with zipfile.ZipFile(base) as zin, zipfile.ZipFile(out, 'w') as zout:
+              for item in zin.infolist():
+                  name = item.filename
+                  if name.startswith('META-INF/') and name.upper().endswith(('.SF', '.RSA', '.DSA', '.EC', '.MF')):
+                      continue
+                  if name == 'assets/hosts.txt':
+                      data = new; found = True
+                  else:
+                      data = zin.read(name)
+                  zout.writestr(item, data, compress_type=item.compress_type)
+          if not found:
+              sys.exit('assets/hosts.txt absent de l APK de base')
+          print('OK ->', out)
+          PY
 
       - name: Zipalign + signature
         env:
@@ -29,12 +58,12 @@ jobs:
           KS_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          echo "build-tools: $BT"
           if [ -n "$KS_B64" ]; then
             echo "$KS_B64" | base64 -d > release.keystore
             KS=release.keystore; PASS="$KS_PASS"; ALIAS="$KS_ALIAS"
           else
-            KS=keystore/wisp.keystore; PASS=wisp1234; ALIAS=wisp
+            KS=$(find . -name 'wisp.keystore' | head -1); PASS=wisp1234; ALIAS=wisp
+            [ -n "$KS" ] || { echo "::error::keystore/wisp.keystore manquant"; exit 1; }
           fi
           "$BT/zipalign" -f -p 4 unsigned.apk aligned.apk
           "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --ks-key-alias "$ALIAS" --out Wisp.apk aligned.apk
@@ -45,8 +74,7 @@ jobs:
           name: Wisp-apk
           path: Wisp.apk
 
-      - name: Release "latest"
-        if: github.ref_type == 'branch'
+      - name: Release latest
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
